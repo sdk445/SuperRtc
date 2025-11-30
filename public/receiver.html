@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SuperRtc Listener</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <style>
+        .chat-scroll::-webkit-scrollbar { width: 6px; }
+        .chat-scroll::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-200 font-sans h-screen flex flex-col items-center justify-center p-4">
+
+    <!-- JOIN CARD -->
+    <div id="joinCard" class="w-full max-w-sm bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-2xl relative overflow-hidden">
+        <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500"></div>
+        <h1 class="text-2xl font-bold text-center mb-6 text-white">Join Broadcast</h1>
+        
+        <div class="space-y-4">
+            <div>
+                <label class="text-xs uppercase font-bold text-slate-500 ml-1">Room ID</label>
+                <input id="roomId" type="text" placeholder="XXXXXX" 
+                    class="w-full bg-slate-950 border border-slate-700 text-center text-2xl font-mono tracking-widest text-white rounded-lg py-3 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 uppercase transition-all">
+            </div>
+            <button onclick="joinRoom()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3.5 rounded-lg transition-all shadow-lg shadow-indigo-900/20">
+                Connect
+            </button>
+            <p id="status" class="text-center text-xs text-slate-500 min-h-[1.5em]"></p>
+        </div>
+    </div>
+
+    <!-- PLAYER UI (Hidden) -->
+    <div id="playerUI" class="hidden w-full max-w-md h-[80vh] flex flex-col bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden">
+        
+        <!-- TOP: Audio Visualizer -->
+        <div class="h-40 bg-slate-950 relative border-b border-slate-800">
+            <canvas id="visualizer" class="w-full h-full"></canvas>
+            
+            <!-- Play Overlay (For Mobile) -->
+            <div id="playOverlay" onclick="resumeAudio()" class="hidden absolute inset-0 bg-black/80 flex flex-col items-center justify-center cursor-pointer z-10 backdrop-blur-sm">
+                <div class="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mb-2 animate-pulse">
+                    <i class="ph-fill ph-play text-3xl text-white pl-1"></i>
+                </div>
+                <span class="text-xs font-bold uppercase tracking-wider text-white">Tap to Unmute</span>
+            </div>
+
+            <div class="absolute top-3 right-3 flex items-center gap-2 bg-slate-900/80 px-2 py-1 rounded-full border border-slate-700/50 backdrop-blur">
+                <div class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+                <span class="text-[10px] font-bold uppercase text-slate-300">Live</span>
+            </div>
+        </div>
+
+        <!-- MIDDLE: Chat Area -->
+        <div class="flex-1 bg-slate-900 flex flex-col min-h-0">
+            <div class="p-3 border-b border-slate-800 bg-slate-900/50">
+                <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wide">Stream Chat</h3>
+            </div>
+            
+            <div id="chatContainer" class="flex-1 overflow-y-auto p-4 space-y-3 chat-scroll">
+                <div class="text-center text-xs text-slate-600 italic my-2">Joined the room</div>
+            </div>
+        </div>
+
+        <!-- BOTTOM: Input -->
+        <div class="p-3 bg-slate-950 border-t border-slate-800">
+            <form onsubmit="event.preventDefault(); sendMessage();" class="flex gap-2">
+                <input type="text" id="chatInput" placeholder="Say something..." 
+                    class="flex-1 bg-slate-900 border border-slate-700 text-slate-200 text-sm rounded-lg px-3 py-2.5 focus:outline-none focus:border-indigo-500 transition-all">
+                <button type="submit" class="bg-indigo-600 text-white p-2.5 rounded-lg hover:bg-indigo-700 transition-colors">
+                    <i class="ph-bold ph-paper-plane-right"></i>
+                </button>
+            </form>
+        </div>
+
+        <audio id="remoteAudio" class="hidden"></audio>
+    </div>
+
+    <script>
+        const socket = io();
+        let pc, dataChannel, rtcConfig;
+        
+        fetch('/api/ice-config').then(r => r.json()).then(c => rtcConfig = c);
+
+        function joinRoom() {
+            const id = document.getElementById('roomId').value.trim().toUpperCase();
+            if(!id) return;
+            
+            document.getElementById('status').textContent = "Connecting to Signal Server...";
+            document.getElementById('status').className = "text-center text-xs text-indigo-400 mt-2";
+            
+            socket.emit('join-room', id);
+        }
+
+        socket.on('joined-room', () => {
+            document.getElementById('joinCard').classList.add('hidden');
+            document.getElementById('playerUI').classList.remove('hidden');
+        });
+
+        socket.on('error', (msg) => {
+            document.getElementById('status').textContent = msg;
+            document.getElementById('status').className = "text-center text-xs text-red-500 mt-2";
+        });
+
+        socket.on('offer', async (p) => {
+            pc = new RTCPeerConnection(rtcConfig);
+
+            // Audio Handling
+            pc.ontrack = (e) => {
+                const audio = document.getElementById('remoteAudio');
+                audio.srcObject = e.streams[0];
+                
+                const playPromise = audio.play();
+                if (playPromise !== undefined) {
+                    playPromise.catch(() => {
+                        document.getElementById('playOverlay').classList.remove('hidden');
+                    });
+                }
+                
+                startVisualizer(e.streams[0]);
+            };
+
+            // Data Channel 
+            pc.ondatachannel = (e) => {
+                dataChannel = e.channel;
+                setupDataChannel(dataChannel);
+            };
+
+            pc.onicecandidate = e => {
+                if(e.candidate) socket.emit('ice-candidate', { target: p.sender, candidate: e.candidate, sender: socket.id });
+            };
+
+            await pc.setRemoteDescription(p.sdp);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('answer', { target: p.sender, sdp: answer, sender: socket.id });
+        });
+
+        socket.on('ice-candidate', p => {
+            if(pc) pc.addIceCandidate(new RTCIceCandidate(p.candidate));
+        });
+
+        //for chat
+        function setupDataChannel(dc) {
+            dc.onopen = () => addSystemMessage("Connected to Host");
+            
+            dc.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if (data.type === 'system') {
+                    addSystemMessage(data.text);
+                } else if (data.type === 'relay') {
+                    // Message from anothers
+                    addMessage(data.text, 'them', `User ${data.senderId}`);
+                } else {
+                    // Message from Host
+                    addMessage(data.text, 'host', 'HOST');
+                }
+            };
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('chatInput');
+            const text = input.value.trim();
+            if(!text || !dataChannel || dataChannel.readyState !== 'open') return;
+            addMessage(text, 'me');
+            dataChannel.send(JSON.stringify({ text: text }));
+            input.value = '';
+        }
+
+        function addMessage(text, type, senderName = '') {
+            const container = document.getElementById('chatContainer');
+            const div = document.createElement('div');
+            
+            if (type === 'me') {
+                div.className = "flex justify-end";
+                div.innerHTML = `<div class="bg-indigo-600 text-white px-3 py-2 rounded-2xl rounded-tr-sm text-sm max-w-[85%] shadow-md">${text}</div>`;
+            } else if (type === 'host') {
+                div.className = "flex justify-start flex-col items-start";
+                div.innerHTML = `<div class="text-[10px] text-emerald-400 font-bold mb-1 ml-1 tracking-wider"><i class="ph-fill ph-crown"></i> HOST</div><div class="bg-slate-800 border border-emerald-500/30 text-emerald-100 px-3 py-2 rounded-2xl rounded-tl-sm text-sm max-w-[85%] shadow-sm">${text}</div>`;
+            } else {
+                div.className = "flex justify-start flex-col items-start";
+                div.innerHTML = `<div class="text-[10px] text-slate-500 mb-1 ml-1">${senderName}</div><div class="bg-slate-800 text-slate-300 px-3 py-2 rounded-2xl rounded-tl-sm text-sm max-w-[85%] border border-slate-700">${text}</div>`;
+            }
+
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function addSystemMessage(text) {
+            const div = document.createElement('div');
+            div.className = "text-center text-[10px] text-slate-600 font-bold uppercase tracking-wide my-2";
+            div.textContent = text;
+            document.getElementById('chatContainer').appendChild(div);
+        }
+
+        //AUDIO UTILS
+        function resumeAudio() {
+            const audio = document.getElementById('remoteAudio');
+            audio.play().then(() => {
+                document.getElementById('playOverlay').classList.add('hidden');
+            });
+        }
+
+        function startVisualizer(stream) {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const analyser = ctx.createAnalyser();
+            const src = ctx.createMediaStreamSource(stream);
+            src.connect(analyser);
+            src.connect(ctx.destination);
+            
+            const canvas = document.getElementById('visualizer');
+            const canvasCtx = canvas.getContext('2d');
+            analyser.fftSize = 64;
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            function draw() {
+                requestAnimationFrame(draw);
+                analyser.getByteFrequencyData(dataArray);
+                canvasCtx.fillStyle = '#0f172a';
+                canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                const barWidth = (canvas.width / bufferLength) * 2;
+                let x = 0;
+                for(let i = 0; i < bufferLength; i++) {
+                    const barHeight = dataArray[i] / 255 * canvas.height;
+                    
+                    const r = barHeight + 50;
+                    const g = 100;
+                    const b = 200;
+                    
+                    canvasCtx.fillStyle = `rgb(${r},${g},${b})`;
+                    canvasCtx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+                    x += barWidth + 2;
+                }
+            }
+            draw();
+        }
+    </script>
+</body>
+</html>
